@@ -54,12 +54,19 @@ piping into `sh`):
 | Variable    | Default | Effect                                        |
 |-------------|---------|-----------------------------------------------|
 | `MAX_LINES` | `60`    | Per-section output limit (keeps the prompt within LLM context) |
+| `REDACT`    | off     | Set to `1` (or `yes`/`true`/`on`) to replace personal identifiers — hostname, usernames, real names, home paths, MAC addresses, public IPs — with consistent placeholders like `[HOST-1]`, `[USER-1]`. Loopback, link-local and private (RFC1918) addresses stay visible. |
 
-Example:
+Examples:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/TyrannosaurusRoot/admin-my-system/main/diagnose.sh | MAX_LINES=120 sh > prompt.txt
+curl -fsSL https://raw.githubusercontent.com/TyrannosaurusRoot/admin-my-system/main/diagnose.sh | REDACT=1 sh > prompt.txt
 ```
+
+With `REDACT=1` the same real value always maps to the same placeholder, so
+the LLM can still correlate entities across sections, and the prompt tells
+it to use the placeholders verbatim in its fix commands — you substitute
+the real values back before running anything.
 
 ## Requirements
 
@@ -73,6 +80,10 @@ curl -fsSL https://raw.githubusercontent.com/TyrannosaurusRoot/admin-my-system/m
   executes it. Read [`diagnose.sh`](diagnose.sh) first — it is a single
   self-contained file with no dependencies.
 - **The generated prompt contains real system details** — hostnames, IP
-  addresses, usernames, running services, open ports. Nothing is redacted.
-  Treat `prompt.txt` as sensitive and review it before sharing it with any
-  third party, including an LLM.
+  addresses, usernames, running services, open ports. By default nothing
+  is redacted. Set `REDACT=1` to replace known personal identifiers with
+  consistent placeholders. Redaction is best-effort pattern matching over
+  identifiers known to the script: free-form log lines (journal, dmesg,
+  failed-login records) may still contain personal details it cannot
+  recognize. Treat `prompt.txt` as sensitive and review it before sharing
+  it with any third party, including an LLM — with or without `REDACT`.

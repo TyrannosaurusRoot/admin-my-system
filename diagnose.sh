@@ -8,10 +8,18 @@
 # prompt is the only thing written to stdout. Configuration is via
 # environment variables only (stdin is not available when piped into sh):
 #   MAX_LINES  - per-section output limit (default: 60)
+#   REDACT     - set to 1/yes/true/on to replace personal identifiers
+#                (hostname, usernames, home paths, MACs, public IPs) with
+#                consistent placeholders like [HOST-1] (default: off)
 
 MAX_LINES="${MAX_LINES:-60}"
 case "$MAX_LINES" in
     ''|*[!0-9]*) MAX_LINES=60 ;;
+esac
+
+case "${REDACT:-}" in
+    1|[Yy]|[Yy][Ee][Ss]|[Tt][Rr][Uu][Ee]|[Oo][Nn]) REDACT=yes ;;
+    *) REDACT=no ;;
 esac
 
 REPORT="$(mktemp "${TMPDIR:-/tmp}/sysdiag.XXXXXX")" || exit 1
@@ -27,6 +35,14 @@ status() {
 have() {
     command -v "$1" >/dev/null 2>&1
 }
+
+# Redaction rewrites the report through awk; emitting an unredacted report
+# after the user asked for redaction would be worse than failing, so bail
+# out early (before any collection) rather than degrade.
+if [ "$REDACT" = "yes" ] && ! have awk; then
+    status "ERROR: REDACT requested but awk is not available - refusing to emit an unredacted report."
+    exit 1
+fi
 
 # run CMD... : execute a command with a timeout (if available), merging
 # stderr so permission errors are visible in context.
@@ -292,6 +308,181 @@ fi
 capture "Logged-in users" who
 capture "Last reboots" sh -c "last reboot 2>/dev/null | head -n 5"
 
+# -------------------------------------------------------------- redaction
+# With REDACT=yes the finished report is streamed through redact_filter,
+# which replaces each personal identifier with a consistent numbered
+# placeholder (the same real value always maps to the same token, so the
+# LLM can still correlate entities across sections). Loopback, link-local
+# and RFC1918 private addresses stay visible - they do not identify the
+# host publicly and help with local-network diagnosis.
+if [ "$REDACT" = "yes" ]; then
+    status "Building redaction lists ..."
+
+    _passwd="$(getent passwd 2>/dev/null || cat /etc/passwd 2>/dev/null || true)"
+
+    # hostnames: FQDN and short form, longest first
+    RD_HOSTS="$( { uname -n 2>/dev/null; hostname 2>/dev/null; } | awk '
+        NF && $0 != "localhost" && !seen[$0]++ {
+            print length($0), $0
+            n = split($0, p, ".")
+            if (n > 1 && !seen[p[1]]++) print length(p[1]), p[1]
+        }' | sort -rn | cut -d' ' -f2- )"
+
+    # human users: UID >= 1000 plus the invoking user; never root or
+    # system accounts (replacing "root" would mangle /root and semantics)
+    RD_USERS="$( { id -un 2>/dev/null | grep -vx root; printf '%s\n' "$_passwd" | awk -F: '
+        $3 + 0 >= 1000 && $3 + 0 != 65534 && $1 != "nobody" { print $1 }'; } | awk 'NF && !seen[$0]++' )"
+
+    # GECOS real names of those users (the login-shell section leaks them);
+    # skip names that are just the capitalized username (e.g. "Ubuntu")
+    RD_NAMES="$(printf '%s\n' "$_passwd" | awk -F: '
+        $3 + 0 >= 1000 && $3 + 0 != 65534 && $1 != "nobody" {
+            split($5, g, ",")
+            if (length(g[1]) > 2 && tolower(g[1]) != $1 && !seen[g[1]]++) print g[1]
+        }')"
+
+    # home dirs whose basename differs from the username (/home/alice is
+    # already covered by the username replacement)
+    RD_HOMES="$(printf '%s\n' "$_passwd" | awk -F: '
+        $3 + 0 >= 1000 && $3 + 0 != 65534 && $1 != "nobody" && length($6) > 1 {
+            n = split($6, p, "/")
+            if (p[n] != $1 && !seen[$6]++) print $6
+        }')"
+
+    RD_DOMAINS="$(awk '/^[[:space:]]*(search|domain)[[:space:]]/ {
+        for (i = 2; i <= NF; i++) if (length($i) > 1 && !seen[$i]++) print $i
+    }' /etc/resolv.conf 2>/dev/null || true)"
+
+    export RD_HOSTS RD_USERS RD_NAMES RD_HOMES RD_DOMAINS
+fi
+
+# redact_filter : stream filter replacing personal identifiers with
+# consistent placeholders. Strictly POSIX awk: no gensub, no \b word
+# boundaries, no {n,m} intervals (mawk/BusyBox portability).
+redact_filter() {
+    awk '
+    BEGIN {
+        WORD = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-"
+        HEXC = "0123456789abcdefABCDEF:"
+        H = "[0-9a-fA-F][0-9a-fA-F]"
+        MAC_RE = H ":" H ":" H ":" H ":" H ":" H
+        O = "[0-9][0-9]?[0-9]?"
+        IPV4_RE = O "\\." O "\\." O "\\." O
+        IPV6_RE = "[0-9a-fA-F:]*:[0-9a-fA-F:]*:[0-9a-fA-F:]*"
+        nhome = split(ENVIRON["RD_HOMES"], homes, "\n")
+        nhost = split(ENVIRON["RD_HOSTS"], hosts, "\n")
+        nname = split(ENVIRON["RD_NAMES"], names, "\n")
+        nuser = split(ENVIRON["RD_USERS"], users, "\n")
+        ndom  = split(ENVIRON["RD_DOMAINS"], doms, "\n")
+    }
+    # same kind+value -> same numbered token, so the report stays correlatable
+    function placeholder(kind, val) {
+        if (!((kind, val) in map))
+            map[kind, val] = "[" kind "-" (++cnt[kind]) "]"
+        return map[kind, val]
+    }
+    function boundary_ok(chars, pre, post) {
+        return (pre == "" || index(chars, pre) == 0) && (post == "" || index(chars, post) == 0)
+    }
+    # replace word-bounded occurrences of literal s; output is built
+    # progressively so inserted placeholders are never re-scanned, and
+    # lastc carries the boundary context across scan continuations
+    function replace_literal(line, s, kind,    out, i, len, pre, post, lastc) {
+        len = length(s)
+        if (len == 0) return line
+        out = ""
+        lastc = ""
+        while ((i = index(line, s)) > 0) {
+            pre = (i > 1) ? substr(line, i - 1, 1) : lastc
+            post = substr(line, i + len, 1)
+            if (boundary_ok(WORD, pre, post)) {
+                out = out substr(line, 1, i - 1) placeholder(kind, s)
+                lastc = "]"
+            } else {
+                out = out substr(line, 1, i - 1 + len)
+                lastc = substr(s, len, 1)
+            }
+            line = substr(line, i + len)
+        }
+        return out line
+    }
+    function replace_regex(line, re, kind, chars,    out, s, pre, post, lastc) {
+        out = ""
+        lastc = ""
+        while (match(line, re) > 0) {
+            s = substr(line, RSTART, RLENGTH)
+            pre = (RSTART > 1) ? substr(line, RSTART - 1, 1) : lastc
+            post = substr(line, RSTART + RLENGTH, 1)
+            if (boundary_ok(chars, pre, post) && valid(kind, s)) {
+                out = out substr(line, 1, RSTART - 1) placeholder(kind, s)
+                lastc = "]"
+            } else {
+                out = out substr(line, 1, RSTART - 1 + RLENGTH)
+                lastc = substr(s, length(s), 1)
+            }
+            line = substr(line, RSTART + RLENGTH)
+        }
+        return out line
+    }
+    function valid(kind, s) {
+        if (kind == "IPV4") return ipv4_ok(s)
+        if (kind == "IPV6") return ipv6_ok(s)
+        return 1
+    }
+    # redact only public IPv4; loopback, unspecified, broadcast/netmask,
+    # link-local and RFC1918 ranges stay visible
+    function ipv4_ok(s,    p, n, i) {
+        n = split(s, p, ".")
+        if (n != 4) return 0
+        for (i = 1; i <= 4; i++) if (p[i] + 0 > 255) return 0
+        if (s == "0.0.0.0") return 0
+        if (p[1] + 0 == 127 || p[1] + 0 == 10 || p[1] + 0 == 255) return 0
+        if (p[1] + 0 == 192 && p[2] + 0 == 168) return 0
+        if (p[1] + 0 == 172 && p[2] + 0 >= 16 && p[2] + 0 <= 31) return 0
+        if (p[1] + 0 == 169 && p[2] + 0 == 254) return 0
+        return 1
+    }
+    # candidates need "::" or >= 4 colons with 1-4 hex chars per group
+    # (spares HH:MM:SS timestamps) and must be structurally plausible
+    # (spares colon-separated fields like passwd lines);
+    # loopback/link-local/ULA stay visible
+    function ipv6_ok(s,    lc, i, colons, groups, n, p) {
+        lc = tolower(s)
+        if (lc == "::" || lc == "::1") return 0
+        if (substr(lc, 1, 4) == "fe80") return 0
+        if (substr(lc, 1, 2) == "fc" || substr(lc, 1, 2) == "fd") return 0
+        if (substr(s, 1, 1) == ":" && substr(s, 1, 2) != "::") return 0
+        if (substr(s, length(s), 1) == ":" && substr(s, length(s) - 1, 2) != "::") return 0
+        i = index(s, "::")
+        if (i > 0 && index(substr(s, i + 1), "::") > 0) return 0
+        colons = 0
+        for (i = 1; i <= length(s); i++) if (substr(s, i, 1) == ":") colons++
+        if (index(s, "::") == 0 && colons < 4) return 0
+        groups = 0
+        n = split(s, p, ":")
+        for (i = 1; i <= n; i++) {
+            if (length(p[i]) > 4) return 0
+            if (index(s, "::") == 0 && length(p[i]) < 1) return 0
+            if (length(p[i]) > 0) groups++
+        }
+        if (groups > 8) return 0
+        return 1
+    }
+    {
+        line = $0
+        for (i = 1; i <= nhome; i++) line = replace_literal(line, homes[i], "HOME")
+        for (i = 1; i <= nhost; i++) line = replace_literal(line, hosts[i], "HOST")
+        for (i = 1; i <= nname; i++) line = replace_literal(line, names[i], "NAME")
+        for (i = 1; i <= nuser; i++) line = replace_literal(line, users[i], "USER")
+        for (i = 1; i <= ndom;  i++) line = replace_literal(line, doms[i], "DOMAIN")
+        line = replace_regex(line, MAC_RE, "MAC", HEXC)
+        line = replace_regex(line, IPV6_RE, "IPV6", HEXC ".")
+        line = replace_regex(line, IPV4_RE, "IPV4", "0123456789.")
+        print line
+    }
+    '
+}
+
 status "Collection complete. Writing LLM prompt to stdout."
 
 # ---------------------------------------------------------------- prompt
@@ -323,13 +514,31 @@ IMPORTANT - answer format requirements:
 - Some sections may be marked as truncated, unavailable, or skipped due
   to missing root privileges - take that into account and, where useful,
   include commands I can run to gather the missing information.
-
-=== BEGIN SYSTEM DIAGNOSTIC REPORT ===
-
 PROMPT_HEADER
 
-printf 'Report generated as user: %s (root: %s)\n\n' "$(id -un 2>/dev/null || echo unknown)" "$IS_ROOT"
-cat "$REPORT"
+if [ "$REDACT" = "yes" ]; then
+cat <<'REDACT_NOTE'
+- Personal identifiers in this report (hostname, usernames, real names,
+  home paths, MAC addresses, public IP addresses) were replaced with
+  consistent placeholders such as [HOST-1], [USER-1], [IPV4-1]. The same
+  placeholder always denotes the same real value. Use the placeholders
+  verbatim wherever the real value would appear in your commands; I will
+  substitute the real values before running them.
+REDACT_NOTE
+fi
+
+printf '\n=== BEGIN SYSTEM DIAGNOSTIC REPORT ===\n\n'
+
+emit_body() {
+    printf 'Report generated as user: %s (root: %s)\n\n' "$(id -un 2>/dev/null || echo unknown)" "$IS_ROOT"
+    cat "$REPORT"
+}
+
+if [ "$REDACT" = "yes" ]; then
+    emit_body | redact_filter
+else
+    emit_body
+fi
 
 cat <<'PROMPT_FOOTER'
 === END SYSTEM DIAGNOSTIC REPORT ===
